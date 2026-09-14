@@ -1,273 +1,129 @@
-name: Build APK
+# AGENTS.md — точка входа в проект (читать первым)
 
-# Собирает APK полностью из исходников этого репозитория:
-#   1) Rust-ядро (libtgwsproxy.so) под arm64-v8a и armeabi-v7a из каталога src/;
-#   2) три APK-варианта (universal / arm64 / arm32) через Gradle assembleRelease.
-# Артефакты сборки лежат во вкладке Actions -> нужный запуск -> Artifacts.
-# При пуше тега вида v0.2.5 APK автоматически попадают в GitHub Release.
+> Обновлено: 2026-09-14 по `tg-project-handover/HANDOVER.md` (первоисточник контекста).
+> Если что-то ниже расходится с кодом — верьте коду и правьте этот файл.
 
-on:
-  push:
-    branches:
-      - '**'
-    tags:
-      - 'v*'
-  pull_request:
-  workflow_dispatch:
+## Что это за проект
 
-concurrency:
-  group: apk-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+Android-приложение **TG WS Proxy Lab** (форк `amurcanov/tg-ws-proxy-android`, upstream `Flowseal/tg-ws-proxy`)
++ **персональный WSS-релей** на своих VPS. Цель: рабочий Telegram на соте **Билайн (Калининград)**,
+где прямой TCP до Telegram блокируется, а Cloudflare TLS зависает.
 
-permissions:
-  contents: read
+```text
+Android (com.tgwsproxy.networklab)
+  └─ локальный MTProto-прокси 127.0.0.1:1443 (Rust libtgwsproxy.so через JNI)
+       └─ WSS/TLS :443 (или :8443 на srv1) ──► Caddy на VPS ──► Go relay :8080
+            └─ raw MTProto TCP :443 ──► Telegram DC1..DC5 + DC203 (медиа/CDN)
+```
 
-env:
-  # NDK, которым собирается Rust-ядро. Должен быть совместим с cargo-ndk.
-  NDK_VERSION: 27.2.12479018
-  # compileSdk из app/build.gradle.kts и минимальная версия Build Tools для AGP 9.
-  ANDROID_PLATFORM_VERSION: android-35
-  BUILD_TOOLS_VERSION: 36.0.0
+- Релей — основной маршрут, Cloudflare — не использовать (не работает на соте).
+- До 8 доменов relay через запятую (failover), общий токен; с v0.2.5 поддержан формат `домен:порт`.
+- Секреты только в `.env` на VPS. В чат/отчёты токены и IP абонента не попадают.
 
-jobs:
-  # ---------------------------------------------------------------------------
-  # 1. Нативное ядро на Rust
-  # ---------------------------------------------------------------------------
-  native-lib:
-    name: Rust core libtgwsproxy.so
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+## Порядок чтения
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+1. этот файл;
+2. `tg-project-handover/HANDOVER.md` — полная хронология, инфраструктура, грабли, план;
+3. `tg-private-relay/README.md` (сервер) и `README.md` (приложение);
+4. `PRIVATE_RELAY.md`, `NETWORK_LAB.md`, `RUNBOOK-relay-na-novom-VPS.md`,
+   `srv1-relay-deploy/README-SRV1.md` (решительно: деплой relay3 на srv1);
+5. `.github/workflows/*.yml` — как собирается проект.
 
-      - name: Install NDK and SDK packages
-        run: |
-          set -e
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "ndk;${NDK_VERSION}" "platforms;${ANDROID_PLATFORM_VERSION}"
+## Инфраструктура (из HANDOVER §3)
 
-      - name: Point cargo-ndk at the installed NDK
-        run: |
-          set -e
-          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          NDK_DIR="${SDK_ROOT}/ndk/${NDK_VERSION}"
-          test -d "$NDK_DIR"
-          echo "ANDROID_NDK_HOME=${NDK_DIR}" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=${NDK_DIR}" >> "$GITHUB_ENV"
+| # | Хост | IP | Роль / состояние |
+|---|---|---|---|
+| 1 | `mg.ageevgroup.ru` | `5.129.239.160` | relay №1, `~/tg-probe/tg-private-relay`, работает (relay **0.1.1** + Caddy 443). Маршрут к DC203 плавает |
+| 2 | `pokehero.ru` | `147.45.152.7` | relay №2, работает (0.1.1 + Caddy 443). Хвост: `docker update --restart=no mtproto-proxy` |
+| 3 | `srv1` | `130.49.141.28` | relay №3 (план). Маршруты 15/15 OK. 443 занят 3x-ui/xray (НЕ ТРОГАТЬ), 80 — nginx → TLS на **8443** + сертификат вручную acme.sh DNS-01 |
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android,armv7-linux-androideabi
+DNS релея — A-запись прямо на IP, в Cloudflare только **DNS only** (серая тучка).
 
-      - name: Cache cargo registry and target directory
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: android
+## Версии и состояние
 
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
+| Компонент | Версия / факт |
+| --- | --- |
+| Приложение | **v0.2.5-relay-port**, versionCode 9, `com.tgwsproxy.networklab`, minSdk 24 / target 35 |
+| Сервер на VPS | **0.1.1** (`relay-versions/tg-private-relay-v0.1.1-media-test-source.zip`) |
+| Сервер в handover (не развёрнут) | **0.1.2** (`tg-private-relay/`, добавлен `/probe-upload`) |
+| Тулчейн приложения | AGP 9.0.1 / Gradle 9.1.0, JDK 17, compileSdk 35, NDK 27.2.12479018 |
+| Токен relay | 32–256 символов, URL-safe; короче — ядро молча выключает релей |
 
-      - name: Build arm64-v8a (minSdk 24)
-        run: cargo ndk -t arm64-v8a --platform 24 -o app/src/main/jniLibs build --release
+Endpoints релея: `/healthz`, `/readyz` (TCP-проверки DC1..5+203, **503 если degraded**),
+`/probe`, `/probe-stream?bytes=`, `/probe-upload?bytes=` (только 0.1.2), `/download?bytes=`,
+`/media-test`, `/apiws?dc=&token=` (токен также принимается как `Authorization: Bearer`).
 
-      - name: Build armeabi-v7a (minSdk 21)
-        run: cargo ndk -t armeabi-v7a --platform 21 -o app/src/main/jniLibs build --release
+Приложение v0.2.5 проходит диагностику и по `/apiws` (это рабочий маршрут, не «только /probe»).
+Проба «Relay WSS upload 50 MiB» против сервера 0.1.1 даёт FAIL — это **ожидаемо**, не баг.
 
-      - name: Sanity check the produced libraries
-        run: |
-          set -e
-          file app/src/main/jniLibs/arm64-v8a/libtgwsproxy.so || true
-          file app/src/main/jniLibs/armeabi-v7a/libtgwsproxy.so || true
-          readelf -h app/src/main/jniLibs/arm64-v8a/libtgwsproxy.so | grep -q 'AArch64'
-          readelf -h app/src/main/jniLibs/armeabi-v7a/libtgwsproxy.so | grep -q 'ARM'
-          ls -l app/src/main/jniLibs/arm64-v8a/libtgwsproxy.so \
-                app/src/main/jniLibs/armeabi-v7a/libtgwsproxy.so
+## Сборка
 
-      - name: Upload native libraries
-        uses: actions/upload-artifact@v4
-        with:
-          name: jniLibs
-          path: app/src/main/jniLibs/**/libtgwsproxy.so
-          if-no-files-found: error
-          retention-days: 14
+- **CI:** `.github/workflows/build-apk.yml` (ядро из `src/` под оба ABI + `assembleRelease` для
+  universal/arm64/arm32, артефакт `apk-<versionName>`, по тегу `v*` — Release) и
+  `.github/workflows/relay.yml` (go vet/test + docker build + smoke-тест контейнера).
+- **Вариант из handover:** `tg-project-handover/tg-ws-proxy-android/.github/workflows/android-build.yml`
+  — `assembleUniversalDebug` + артефакт `TG-WS-Proxy-Lab-debug-apk`, сборка по тегу/вручную.
+- **Локально:** `build_so.bat` → `build_apk.bat`.
+- **Подпись:** чтобы APK с CI ставился **поверх** установленного, подпись должна совпадать с
+  `keystore/debug.keystore` (storepass `android`, alias `androiddebugkey`, SHA-256 `F8:7E:2B:3C:...:61`).
+  Без него CI подписывает своим debug-ключом раннера → «поверх» не встанет.
+  Альтернатива: release-ключ в секретах `ANDROID_KEYSTORE_BASE64/_PASSWORD/_ALIAS/_PASSWORD`.
 
-  # ---------------------------------------------------------------------------
-  # 2. APK из Kotlin/Compose исходников + собранное ядро
-  # ---------------------------------------------------------------------------
-  apk:
-    name: APK (assembleRelease)
-    runs-on: ubuntu-latest
-    needs: native-lib
-    permissions:
-      contents: write # нужно для публикации GitHub Release по тегу
-    env:
-      # Необязательные секреты для подписи release-ключом.
-      # Если их нет, APK подписывается debug-ключом (см. app/build.gradle.kts).
-      KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-      KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-      KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-      KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+## Грабли (каждая уже стоила времени)
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
+1. **`.gitignore` с правилом `relay` без слеша** молча исключает каталог `cmd/relay/` из git.
+   Баг живёт в **двух** файлах: корневой `.gitignore` и `tg-project-handover/tg-private-relay/.gitignore`.
+   Из-за него исходник сервера `cmd/relay/main.go` до сих пор отсутствует в репозитории как файл —
+   он есть только внутри zip в `relay-versions/`. Менять на `/relay` (бинарник в корне) и
+   после правки проверять `git status`/`git check-ignore`.
+2. **Память Gradle:** в `gradle.properties` лимиты под слабую машину (`-Xmx1400m`,
+   `MaxMetaspaceSize=384m`); на CI этого мало (`OutOfMemoryError: Metaspace`) — поднимать только в CI.
+3. **`gradlew` терял бит запуска** (100644) — в CI падало на `./gradlew`.
+4. **R8/minify выключены** (`isMinifyEnabled=false`) — иначе OOM; иконки только `material-icons-core`.
+5. **DC203 (91.105.192.100:443) обязателен** — публичные каналы, видео, реакции, custom emoji.
+   Подмена `DC203→DC2` ломала медиа; для relay нужно `let relay_dc = dc;`.
+6. **Маршрут VPS→DC203 может плавать сутками** — лечится проверкой `./scripts/check-vps.sh`
+   (15 прогонов) и failover-списком доменов в приложении.
+7. **Порты:** srv1 использует 8443, сертификат продлевается вручную (DNS-01 acme.sh, раз в ~80 дней).
+8. **Лимит workspace ~128 МБ** — лишние тулчейны/APK молча выкидываются из снапшота.
+9. **Публичный репозиторий:** закоммичен `keystore/debug.keystore` → кто угодно может подписать APK,
+   который Android примет как обновление установленного приложения. План был «приватный репо» —
+   решить: приватность, отдельный ключ для CI или принять риск. В доках есть реальные IP/домены VPS.
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+## Не коммитить / следить
 
-      - name: Install SDK packages
-        run: |
-          set -e
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;${ANDROID_PLATFORM_VERSION}" "build-tools;${BUILD_TOOLS_VERSION}"
+`.env` (в нём `RELAY_TOKEN`), пароли и SSH-ключи, токены ntfy, личные IP абонента.
+`target/`, `app/build/`, `local.properties` — только через `.gitignore`.
 
-      - name: Download freshly built native libraries
-        uses: actions/download-artifact@v4
-        with:
-          name: jniLibs
-          path: app/src/main/jniLibs
+## Расхождение копий приложения (проверено 2026-09-14)
 
-      - name: Verify native libraries are in place
-        run: |
-          set -e
-          ls -l app/src/main/jniLibs/arm64-v8a/libtgwsproxy.so
-          ls -l app/src/main/jniLibs/armeabi-v7a/libtgwsproxy.so
+В репозитории две копии исходников приложения и они **не эквивалентны** (детали — в
+`HANDOVER-COMPARE.md`): корневая копия новее по коду (поддержка `домен:порт`, v0.2.5),
+`tg-project-handover/tg-ws-proxy-android/` новее по упаковке (CI `android-build.yml`,
+`CI-BUILD.md`, `keystore/debug.keystore` + пиннинг debug-подписи в `app/build.gradle.kts`).
+Расходятся всего 10 позиций, остальное совпадает побайтово.
 
-      - name: Decode release keystore (only if secrets are configured)
-        if: ${{ env.KEYSTORE_BASE64 != '' }}
-        run: |
-          set -e
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > release.keystore
-          printf 'KEYSTORE_FILE=../release.keystore\nKEYSTORE_PASSWORD=%s\nKEY_ALIAS=%s\nKEY_PASSWORD=%s\n' \
-            "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > local.properties
-          chmod 600 release.keystore local.properties
-          echo "Release signing secrets found: APK will be signed with your key."
+В частности: `ProxyController.kt`, `NetworkDiagnostics.kt`, `res/values/strings.xml`,
+`res/values-ru/strings.xml` — новее в корне; `app/build.gradle.kts`, `.gitignore`, keystore,
+`CI-BUILD.md`, `.github/workflows/android-build.yml` — только/новее в handover.
+Исходник сервера `cmd/relay/main.go` в текстовом виде отсутствует в обеих копиях —
+он есть только внутри zip в `relay-versions/`.
 
-      - name: Gradle setup (cache + wrapper validation)
-        uses: gradle/actions/setup-gradle@v4
+## Статус и что дальше
 
-      - name: Show toolchain versions
-        run: |
-          java -version
-          ./gradlew --version
+- PR #1 (CI + восстановленный relay) был смержен, но **`main` сейчас перезаписан**: 3 коммита,
+  каталога `.github/` нет, CI в `main` отсутствует. Работа живёт в ветке
+  `arena/01a09fc8-tg-ws-proxy-adr`. Также в `main` файл `AGENTS.md` содержит текст
+  workflow вместо этого документа — заменить.
+- Ближайшие шаги (HANDOVER §7): проверить, что CI-APK ставится поверх (совпадение подписи);
+  тест v0.2.5 на телефоне с тремя доменами и failover; деплой relay3 на srv1; проверка порта 8443
+  с соты; хвосты `.env` VPS#1 и `mtproto-proxy` на VPS#2; пересборка ntfy-монитора.
+- Бэклог: пары домен+токен, классификация логов relay (`client_closed/upstream_closed/timeout`),
+  встроенные логи в приложение (на Vivo вкладка логов пуста из-за logcat), развернуть сервер 0.1.2.
 
-      - name: Build release APKs
-        run: |
-          set -e
-          # gradle.properties в репозитории настроен на слабую локальную машину
-          # (-Xmx1400m, MaxMetaspaceSize=384m, компилятор Kotlin в процессе Gradle).
-          # На раннере таких лимитов не хватает: сборка AGP 9 падает с
-          # "java.lang.OutOfMemoryError: Metaspace". Поднимаем их только в CI,
-          # локальные настройки репозитория не меняются.
-          sed -i -E \
-            -e 's|^org\.gradle\.jvmargs=.*|org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8|' \
-            -e 's|^kotlin\.daemon\.jvmargs=.*|kotlin.daemon.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=768m|' \
-            gradle.properties
-          echo '--- gradle.properties (CI override) ---'
-          grep -E '^(org.gradle.jvmargs|kotlin.daemon.jvmargs|kotlin.compiler.execution.strategy)=' gradle.properties
+## Правила для агента
 
-          ./gradlew --no-daemon --stacktrace assembleRelease
-
-      - name: Collect APKs, rename and checksum
-        id: collect
-        run: |
-          set -e
-          VERSION_NAME=$(sed -nE 's/.*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' app/build.gradle.kts | head -n 1)
-          if [ -z "$VERSION_NAME" ]; then
-            echo "::error::Cannot read versionName from app/build.gradle.kts"
-            exit 1
-          fi
-          echo "version=$VERSION_NAME" >> "$GITHUB_OUTPUT"
-          PREFIX="v${VERSION_NAME}-android"
-          echo "PREFIX=$PREFIX" >> "$GITHUB_ENV"
-          mkdir -p dist
-
-          collect() { # $1 = flavor dir, $2 = target file suffix, $3 = ожидаемые ABI
-            local flavor="$1" suffix="$2" abis="$3" apk=""
-            apk="app/build/outputs/apk/${flavor}/release/app-${flavor}-release.apk"
-            if [ ! -f "$apk" ]; then
-              apk=$(find "app/build/outputs/apk/${flavor}" -name '*.apk' -type f 2>/dev/null | head -n 1 || true)
-            fi
-            if [ -z "$apk" ] || [ ! -f "$apk" ]; then
-              echo "::error::APK for flavor ${flavor} not found"
-              return 1
-            fi
-            cp "$apk" "dist/${PREFIX}-${suffix}.apk"
-
-            # Проверяем, что внутри APK действительно есть код и собранное ядро:
-            # «успешная» сборка без libtgwsproxy.so бесполезна на телефоне.
-            local listing
-            listing=$(unzip -l "dist/${PREFIX}-${suffix}.apk")
-            echo "$listing" | grep -q 'classes.dex' || {
-              echo "::error::${PREFIX}-${suffix}.apk does not contain classes.dex"
-              return 1
-            }
-            for abi in $abis; do
-              echo "$listing" | grep -q "lib/${abi}/libtgwsproxy.so" || {
-                echo "::error::${PREFIX}-${suffix}.apk does not contain lib/${abi}/libtgwsproxy.so"
-                return 1
-              }
-            done
-            printf '  [OK] %s  (%s bytes, ABI: %s)\n' \
-              "${PREFIX}-${suffix}.apk" "$(stat -c %s "dist/${PREFIX}-${suffix}.apk")" "$abis"
-          }
-
-          echo "Version: ${VERSION_NAME}"
-          collect universal universal    "arm64-v8a armeabi-v7a"
-          collect arm64     v8a-minsdk24 "arm64-v8a"
-          collect arm32     v7a-minsdk21 "armeabi-v7a"
-
-          (cd dist && sha256sum ./*.apk > SHA256SUMS.txt && cat SHA256SUMS.txt)
-
-      - name: Verify APK signatures
-        run: |
-          set -e
-          APKSIGNER="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/build-tools/${BUILD_TOOLS_VERSION}/apksigner"
-          for apk in dist/*.apk; do
-            echo "== $apk"
-            "$APKSIGNER" verify --print-certs "$apk" | head -n 6
-          done
-
-      - name: Build summary
-        run: |
-          {
-            echo "### APK ${PREFIX}"
-            echo
-            echo "| Файл | Размер |"
-            echo "| --- | --- |"
-            for f in dist/*.apk dist/SHA256SUMS.txt; do
-              echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |"
-            done
-            echo
-            echo "Подпись: $([ -n "$KEYSTORE_BASE64" ] && echo 'release-ключ из секретов' || echo 'debug-ключ (секреты не настроены)')"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload APKs
-        uses: actions/upload-artifact@v4
-        with:
-          name: apk-${{ steps.collect.outputs.version }}
-          path: |
-            dist/*.apk
-            dist/SHA256SUMS.txt
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Publish GitHub Release (only on v* tags)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/*.apk
-            dist/SHA256SUMS.txt
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+- Отвечать по-русски, давать точные команды и конфиги; секреты не запрашивать и не выводить.
+- Перед правкой ядра (Rust) или релея (Go) свериться с `tg-project-handover/` и zip-версиями,
+  не переписывать по догадкам.
+- После значимых изменений обновлять этот файл и `HANDOVER.md`.
