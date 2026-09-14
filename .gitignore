@@ -1,6 +1,9 @@
 .env
 *.log
-relay
+# Скомпилированный бинарник релея в корне проекта (go build -o relay).
+# ВАЖНО: без ведущего слеша шаблон "relay" игнорировал бы и каталог
+# с исходниками tg-private-relay/cmd/relay/.
+/relay
 
 # --- build outputs ---
 target/

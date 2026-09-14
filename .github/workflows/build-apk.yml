@@ -117,7 +117,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -162,7 +162,21 @@ jobs:
           ./gradlew --version
 
       - name: Build release APKs
-        run: ./gradlew --no-daemon --stacktrace assembleRelease
+        run: |
+          set -e
+          # gradle.properties в репозитории настроен на слабую локальную машину
+          # (-Xmx1400m, MaxMetaspaceSize=384m, компилятор Kotlin в процессе Gradle).
+          # На раннере таких лимитов не хватает: сборка AGP 9 падает с
+          # "java.lang.OutOfMemoryError: Metaspace". Поднимаем их только в CI,
+          # локальные настройки репозитория не меняются.
+          sed -i -E \
+            -e 's|^org\.gradle\.jvmargs=.*|org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8|' \
+            -e 's|^kotlin\.daemon\.jvmargs=.*|kotlin.daemon.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=768m|' \
+            gradle.properties
+          echo '--- gradle.properties (CI override) ---'
+          grep -E '^(org.gradle.jvmargs|kotlin.daemon.jvmargs|kotlin.compiler.execution.strategy)=' gradle.properties
+
+          ./gradlew --no-daemon --stacktrace assembleRelease
 
       - name: Collect APKs, rename and checksum
         id: collect

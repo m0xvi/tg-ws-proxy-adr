@@ -20,12 +20,42 @@ Cloudflare не используется.
 ## Что делает и чего не делает
 
 - `/healthz` — обычная проверка HTTPS.
+- `/readyz` — TCP-проверка доступности DC из VPS (важно смотреть `dc203`).
 - `/probe` — безопасный публичный WebSocket handshake без подключения к Telegram. Нужен для Network Lab.
+- `/download?bytes=N`, `/probe-stream?bytes=N`, `/probe-upload?bytes=N` — проверки больших передач, которые гоняет встроенная диагностика приложения.
 - `/apiws?dc=2` — закрытый relay endpoint; требует `Authorization: Bearer ...` или `token` в query.
 - Релей принимает только заранее заданные Telegram DC, поэтому не является универсальным открытым прокси.
 - MTProto-содержимое не журналируется. В лог попадают только номер сессии, DC, длительность и счётчики байт.
 
-Текущая версия Android Network Lab умеет проверить `/probe`, но ещё не направляет через `/apiws` рабочий Telegram-трафик. Подключение relay в транспортное ядро выполняется следующим этапом после успешного теста с мобильного Билайна.
+Рабочий трафик приложения идёт именно через `/apiws`: транспортное ядро
+(`src/proxy.rs`, функция `private_relay_acquire_ws`) пробует приватный релей
+первым, до Cloudflare и до прямого TCP. Токен передаётся в query-параметре,
+диагностика в приложении — заголовком `Authorization: Bearer`.
+
+## Исходники в этом репозитории
+
+```text
+cmd/relay/main.go        — HTTP/WebSocket сервер релея (один бинарник, без сторонних зависимостей кроме coder/websocket)
+cmd/relay/main_test.go   — тесты: handshake, авторизация, белый список DC, туннелирование, /readyz
+Dockerfile               — сборка статического бинарника и scratch-образа
+compose.yaml             — relay + Caddy
+Caddyfile                — терминация TLS, отключённый access log
+scripts/prepare.sh       — генерация .env со случайным токеном
+scripts/check-vps.sh     — проверка маршрутов VPS до Telegram DC
+```
+
+Переменные окружения: `LISTEN_ADDR` (по умолчанию `:8080`), `RELAY_TOKEN`
+(обязательно, 32–256 символов — приложение включает релей только для такой
+длины), `MAX_CONNECTIONS` (по умолчанию `256`), `WS_READ_LIMIT_BYTES`
+(по умолчанию `2 MiB`, лимит на одно WebSocket-сообщение от клиента).
+
+Проверка перед деплоем (то же самое выполняет GitHub Actions):
+
+```bash
+cd tg-private-relay
+go test ./... && go vet ./...
+docker build -t tg-relay:ci .
+```
 
 ## Требования
 
