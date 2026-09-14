@@ -236,6 +236,8 @@ jobs:
           for apk in dist/*.apk; do
             echo "== $apk"
             "$APKSIGNER" verify --print-certs "$apk" | head -n 6
+            FP=$("$APKSIGNER" verify --print-certs "$apk" | grep -m1 -oE "[0-9a-f]{64}" | tr 'a-f' 'A-F' | sed -e 's/../&:/g' -e 's/:$//')
+            echo "::notice::$apk signer SHA-256: $FP"
           done
 
       - name: Build summary

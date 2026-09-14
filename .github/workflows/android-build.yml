@@ -103,6 +103,18 @@ jobs:
              "TG-WS-Proxy-Lab-${VN}-universal-debug.apk"
           ls -la TG-WS-Proxy-Lab-*.apk
 
+      - name: Show APK certificate fingerprints
+        run: |
+          set -e
+          APK=$(ls TG-WS-Proxy-Lab-*.apk | head -n 1)
+          APKSIGNER="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/build-tools/35.0.0/apksigner"
+          echo "== $APK"
+          "$APKSIGNER" verify --print-certs "$APK"
+          # Отпечаток дублируем в notice-аннотацию: она видна в Checks UI
+          # и доступна через API (удобно сверять подпись без скачивания APK).
+          FP=$("$APKSIGNER" verify --print-certs "$APK" | grep -m1 -oE "[0-9a-f]{64}" | tr 'a-f' 'A-F' | sed -e 's/../&:/g' -e 's/:$//')
+          echo "::notice::APK signer SHA-256: $FP (phone expects F8:7E:2B:3C:38:5C:4E:68:0B:12:E9:5E:E8:42:74:B5:D7:E7:C8:4C:1F:61:8D:B2:9D:FB:9B:C6:D4:15:F6:61)"
+
       - name: Upload artifact (available from the run page)
         uses: actions/upload-artifact@v4
         with:
