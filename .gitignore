@@ -1,3 +1,16 @@
 .env
 *.log
 relay
+
+# --- build outputs ---
+target/
+app/build/
+app/release/
+.gradle/
+dist/
+
+# --- local machine files ---
+local.properties
+*.keystore
+*.jks
+*.apk

@@ -77,6 +77,51 @@ Telegram Android → Локальный MTProto (по умолчанию 127.0.0
 
 ---
 
+## Сборка APK на GitHub Actions
+
+В репозитории есть workflow [`.github/workflows/build-apk.yml`](.github/workflows/build-apk.yml) — GitHub собирает APK полностью из исходников, без локального окружения.
+
+Когда запускается:
+
+- на каждый `push` в любую ветку;
+- на `push` тега вида `v*` (например `v0.2.5-relay-port`);
+- вручную: вкладка **Actions** → **Build APK** → **Run workflow**;
+- на pull request.
+
+Что делает workflow:
+
+1. `native-lib` — ставит Rust-тулчейн и Android NDK, собирает `src/` в `libtgwsproxy.so` под `arm64-v8a` (minSdk 24) и `armeabi-v7a` (minSdk 21) через `cargo-ndk`, проверяет архитектуру через `readelf` и отдаёт библиотеки артефактом `jniLibs`.
+2. `apk` — ставит JDK 17 и Android SDK (platform `android-35`, build-tools `36.0.0`), подкладывает собранные `.so` в `app/src/main/jniLibs`, подписывает (если настроены секреты) и запускает `./gradlew assembleRelease`.
+
+Результат: артефакт `apk-<versionName>` с тремя файлами, имена как у локального скрипта `build_apk.bat`:
+
+```text
+v<versionName>-android-universal.apk     все архитектуры
+v<versionName>-android-v8a-minsdk24.apk  только 64-bit ARM
+v<versionName>-android-v7a-minsdk21.apk  только 32-bit ARM
+```
+
+Плюс `SHA256SUMS.txt`. При пуше тега `v*` эти же файлы автоматически прикладываются к GitHub Release.
+
+### Подпись release-ключом (необязательно)
+
+Без секретов APK подписывается debug-ключом: он ставится на телефон, но не подойдёт для обновления поверх сборки с другим ключом. Чтобы подписывать своим ключом, создайте ключ и добавьте в **Settings → Secrets and variables → Actions** четыре секрета:
+
+```bash
+keytool -genkeypair -v -keystore release.keystore -alias tgwsproxy \
+  -keyalg RSA -keysize 2048 -validity 10000
+base64 -w0 release.keystore > keystore.b64   # содержимое файла -> секрет
+```
+
+| Секрет | Значение |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | содержимое `keystore.b64` |
+| `ANDROID_KEYSTORE_PASSWORD` | пароль keystore |
+| `ANDROID_KEY_ALIAS` | `tgwsproxy` (или свой alias) |
+| `ANDROID_KEY_PASSWORD` | пароль ключа |
+
+Локальная сборка (`build_so.bat` + `build_apk.bat`) продолжает работать как раньше: workflow читает те же `versionName` из `app/build.gradle.kts` и раскладывает APK по той же схеме имён.
+
 ## Лицензия
 
 Этот форк распространяется под лицензией **GPLv3**. Оригинальный код `tg-ws-proxy` от [Flowseal](https://github.com/Flowseal) доступен под лицензией **MIT**.
