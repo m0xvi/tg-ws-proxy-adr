@@ -192,8 +192,8 @@ jobs:
           echo "PREFIX=$PREFIX" >> "$GITHUB_ENV"
           mkdir -p dist
 
-          collect() { # $1 = flavor dir, $2 = target file suffix
-            local flavor="$1" suffix="$2" apk=""
+          collect() { # $1 = flavor dir, $2 = target file suffix, $3 = ожидаемые ABI
+            local flavor="$1" suffix="$2" abis="$3" apk=""
             apk="app/build/outputs/apk/${flavor}/release/app-${flavor}-release.apk"
             if [ ! -f "$apk" ]; then
               apk=$(find "app/build/outputs/apk/${flavor}" -name '*.apk' -type f 2>/dev/null | head -n 1 || true)
@@ -203,13 +203,29 @@ jobs:
               return 1
             fi
             cp "$apk" "dist/${PREFIX}-${suffix}.apk"
-            printf '  [OK] %s  (%s bytes)\n' "${PREFIX}-${suffix}.apk" "$(stat -c %s "dist/${PREFIX}-${suffix}.apk")"
+
+            # Проверяем, что внутри APK действительно есть код и собранное ядро:
+            # «успешная» сборка без libtgwsproxy.so бесполезна на телефоне.
+            local listing
+            listing=$(unzip -l "dist/${PREFIX}-${suffix}.apk")
+            echo "$listing" | grep -q 'classes.dex' || {
+              echo "::error::${PREFIX}-${suffix}.apk does not contain classes.dex"
+              return 1
+            }
+            for abi in $abis; do
+              echo "$listing" | grep -q "lib/${abi}/libtgwsproxy.so" || {
+                echo "::error::${PREFIX}-${suffix}.apk does not contain lib/${abi}/libtgwsproxy.so"
+                return 1
+              }
+            done
+            printf '  [OK] %s  (%s bytes, ABI: %s)\n' \
+              "${PREFIX}-${suffix}.apk" "$(stat -c %s "dist/${PREFIX}-${suffix}.apk")" "$abis"
           }
 
           echo "Version: ${VERSION_NAME}"
-          collect universal universal
-          collect arm64     v8a-minsdk24
-          collect arm32     v7a-minsdk21
+          collect universal universal    "arm64-v8a armeabi-v7a"
+          collect arm64     v8a-minsdk24 "arm64-v8a"
+          collect arm32     v7a-minsdk21 "armeabi-v7a"
 
           (cd dist && sha256sum ./*.apk > SHA256SUMS.txt && cat SHA256SUMS.txt)
 
