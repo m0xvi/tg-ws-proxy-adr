@@ -1,0 +1,273 @@
+name: Build APK
+
+# Собирает APK полностью из исходников этого репозитория:
+#   1) Rust-ядро (libtgwsproxy.so) под arm64-v8a и armeabi-v7a из каталога src/;
+#   2) три APK-варианта (universal / arm64 / arm32) через Gradle assembleRelease.
+# Артефакты сборки лежат во вкладке Actions -> нужный запуск -> Artifacts.
+# При пуше тега вида v0.2.5 APK автоматически попадают в GitHub Release.
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: apk-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # NDK, которым собирается Rust-ядро. Должен быть совместим с cargo-ndk.
+  NDK_VERSION: 27.2.12479018
+  # compileSdk из app/build.gradle.kts и минимальная версия Build Tools для AGP 9.
+  ANDROID_PLATFORM_VERSION: android-35
+  BUILD_TOOLS_VERSION: 36.0.0
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Нативное ядро на Rust
+  # ---------------------------------------------------------------------------
+  native-lib:
+    name: Rust core libtgwsproxy.so
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK and SDK packages
+        run: |
+          set -e
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "ndk;${NDK_VERSION}" "platforms;${ANDROID_PLATFORM_VERSION}"
+
+      - name: Point cargo-ndk at the installed NDK
+        run: |
+          set -e
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          NDK_DIR="${SDK_ROOT}/ndk/${NDK_VERSION}"
+          test -d "$NDK_DIR"
+          echo "ANDROID_NDK_HOME=${NDK_DIR}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=${NDK_DIR}" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build arm64-v8a (minSdk 24)
+        run: cargo ndk -t arm64-v8a --platform 24 -o app/src/main/jniLibs build --release
+
+      - name: Build armeabi-v7a (minSdk 21)
+        run: cargo ndk -t armeabi-v7a --platform 21 -o app/src/main/jniLibs build --release
+
+      - name: Sanity check the produced libraries
+        run: |
+          set -e
+          file app/src/main/jniLibs/arm64-v8a/libtgwsproxy.so || true
+          file app/src/main/jniLibs/armeabi-v7a/libtgwsproxy.so || true
+          readelf -h app/src/main/jniLibs/arm64-v8a/libtgwsproxy.so | grep -q 'AArch64'
+          readelf -h app/src/main/jniLibs/armeabi-v7a/libtgwsproxy.so | grep -q 'ARM'
+          ls -l app/src/main/jniLibs/arm64-v8a/libtgwsproxy.so \
+                app/src/main/jniLibs/armeabi-v7a/libtgwsproxy.so
+
+      - name: Upload native libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: jniLibs
+          path: app/src/main/jniLibs/**/libtgwsproxy.so
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 2. APK из Kotlin/Compose исходников + собранное ядро
+  # ---------------------------------------------------------------------------
+  apk:
+    name: APK (assembleRelease)
+    runs-on: ubuntu-latest
+    needs: native-lib
+    permissions:
+      contents: write # нужно для публикации GitHub Release по тегу
+    env:
+      # Необязательные секреты для подписи release-ключом.
+      # Если их нет, APK подписывается debug-ключом (см. app/build.gradle.kts).
+      KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          set -e
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;${ANDROID_PLATFORM_VERSION}" "build-tools;${BUILD_TOOLS_VERSION}"
+
+      - name: Download freshly built native libraries
+        uses: actions/download-artifact@v4
+        with:
+          name: jniLibs
+          path: app/src/main/jniLibs
+
+      - name: Verify native libraries are in place
+        run: |
+          set -e
+          ls -l app/src/main/jniLibs/arm64-v8a/libtgwsproxy.so
+          ls -l app/src/main/jniLibs/armeabi-v7a/libtgwsproxy.so
+
+      - name: Decode release keystore (only if secrets are configured)
+        if: ${{ env.KEYSTORE_BASE64 != '' }}
+        run: |
+          set -e
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > release.keystore
+          printf 'KEYSTORE_FILE=../release.keystore\nKEYSTORE_PASSWORD=%s\nKEY_ALIAS=%s\nKEY_PASSWORD=%s\n' \
+            "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > local.properties
+          chmod 600 release.keystore local.properties
+          echo "Release signing secrets found: APK will be signed with your key."
+
+      - name: Gradle setup (cache + wrapper validation)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Show toolchain versions
+        run: |
+          java -version
+          ./gradlew --version
+
+      - name: Build release APKs
+        run: |
+          set -e
+          # gradle.properties в репозитории настроен на слабую локальную машину
+          # (-Xmx1400m, MaxMetaspaceSize=384m, компилятор Kotlin в процессе Gradle).
+          # На раннере таких лимитов не хватает: сборка AGP 9 падает с
+          # "java.lang.OutOfMemoryError: Metaspace". Поднимаем их только в CI,
+          # локальные настройки репозитория не меняются.
+          sed -i -E \
+            -e 's|^org\.gradle\.jvmargs=.*|org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8|' \
+            -e 's|^kotlin\.daemon\.jvmargs=.*|kotlin.daemon.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=768m|' \
+            gradle.properties
+          echo '--- gradle.properties (CI override) ---'
+          grep -E '^(org.gradle.jvmargs|kotlin.daemon.jvmargs|kotlin.compiler.execution.strategy)=' gradle.properties
+
+          ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: Collect APKs, rename and checksum
+        id: collect
+        run: |
+          set -e
+          VERSION_NAME=$(sed -nE 's/.*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' app/build.gradle.kts | head -n 1)
+          if [ -z "$VERSION_NAME" ]; then
+            echo "::error::Cannot read versionName from app/build.gradle.kts"
+            exit 1
+          fi
+          echo "version=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          PREFIX="v${VERSION_NAME}-android"
+          echo "PREFIX=$PREFIX" >> "$GITHUB_ENV"
+          mkdir -p dist
+
+          collect() { # $1 = flavor dir, $2 = target file suffix, $3 = ожидаемые ABI
+            local flavor="$1" suffix="$2" abis="$3" apk=""
+            apk="app/build/outputs/apk/${flavor}/release/app-${flavor}-release.apk"
+            if [ ! -f "$apk" ]; then
+              apk=$(find "app/build/outputs/apk/${flavor}" -name '*.apk' -type f 2>/dev/null | head -n 1 || true)
+            fi
+            if [ -z "$apk" ] || [ ! -f "$apk" ]; then
+              echo "::error::APK for flavor ${flavor} not found"
+              return 1
+            fi
+            cp "$apk" "dist/${PREFIX}-${suffix}.apk"
+
+            # Проверяем, что внутри APK действительно есть код и собранное ядро:
+            # «успешная» сборка без libtgwsproxy.so бесполезна на телефоне.
+            local listing
+            listing=$(unzip -l "dist/${PREFIX}-${suffix}.apk")
+            echo "$listing" | grep -q 'classes.dex' || {
+              echo "::error::${PREFIX}-${suffix}.apk does not contain classes.dex"
+              return 1
+            }
+            for abi in $abis; do
+              echo "$listing" | grep -q "lib/${abi}/libtgwsproxy.so" || {
+                echo "::error::${PREFIX}-${suffix}.apk does not contain lib/${abi}/libtgwsproxy.so"
+                return 1
+              }
+            done
+            printf '  [OK] %s  (%s bytes, ABI: %s)\n' \
+              "${PREFIX}-${suffix}.apk" "$(stat -c %s "dist/${PREFIX}-${suffix}.apk")" "$abis"
+          }
+
+          echo "Version: ${VERSION_NAME}"
+          collect universal universal    "arm64-v8a armeabi-v7a"
+          collect arm64     v8a-minsdk24 "arm64-v8a"
+          collect arm32     v7a-minsdk21 "armeabi-v7a"
+
+          (cd dist && sha256sum ./*.apk > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Verify APK signatures
+        run: |
+          set -e
+          APKSIGNER="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/build-tools/${BUILD_TOOLS_VERSION}/apksigner"
+          for apk in dist/*.apk; do
+            echo "== $apk"
+            "$APKSIGNER" verify --print-certs "$apk" | head -n 6
+          done
+
+      - name: Build summary
+        run: |
+          {
+            echo "### APK ${PREFIX}"
+            echo
+            echo "| Файл | Размер |"
+            echo "| --- | --- |"
+            for f in dist/*.apk dist/SHA256SUMS.txt; do
+              echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |"
+            done
+            echo
+            echo "Подпись: $([ -n "$KEYSTORE_BASE64" ] && echo 'release-ключ из секретов' || echo 'debug-ключ (секреты не настроены)')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ steps.collect.outputs.version }}
+          path: |
+            dist/*.apk
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release (only on v* tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.apk
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
