@@ -1,3 +1,38 @@
-.env
+# Gradle / Android
+.gradle/
+build/
+app/build/
+app/release/
+dist/
+local.properties
+.idea/
+*.iml
+.kotlin/
+.cxx/
+
+# Rust
+target/
+
+# Логи
 *.log
-relay
+
+# Секреты: .env (в нём RELAY_TOKEN) и ключи подписи НЕ коммитятся.
+# В CI ключи восстанавливаются из секретов (DEBUG_KEYSTORE_BASE64,
+# ANDROID_KEYSTORE_BASE64); локальные копии лежат вне git.
+.env
+keystore/
+*.keystore
+*.jks
+release.keystore
+
+# Go-релей: скомпилированный бинарник в корне (go build -o relay).
+# Ведущий слеш обязателен: без него шаблон игнорировал бы и каталог
+# с исходниками tg-private-relay/cmd/relay/.
+/relay
+
+# Тяжёлые артефакты handover-архива — только локально, вне git.
+# (CI всё пересобирает из src/; настоящий main.go релея уже извлечён
+# из zip в tg-private-relay/cmd/relay/.)
+tg-project-handover/apk/
+tg-project-handover/relay-versions/
+*.apk

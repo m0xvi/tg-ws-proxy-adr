@@ -1,0 +1,71 @@
+name: Build relay server
+
+# Проверяет серверную часть (tg-private-relay) ровно так, как она разворачивается
+# на VPS: go vet + go test (httptest, реальные WebSocket-хендшейки) + docker build
+# того же Dockerfile, который использует docker compose на сервере.
+
+on:
+  push:
+    paths:
+      - 'tg-private-relay/**'
+      - '.github/workflows/relay.yml'
+  pull_request:
+    paths:
+      - 'tg-private-relay/**'
+      - '.github/workflows/relay.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: relay-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  relay:
+    name: go vet + go test + docker build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tg-private-relay
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tg-private-relay/go.mod
+          cache-dependency-path: tg-private-relay/go.sum
+
+      - name: Download modules
+        run: go mod download
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: Build the deployment image (same Dockerfile as on the VPS)
+        run: docker build -t tg-relay:ci .
+
+      - name: Smoke test the container
+        run: |
+          set -e
+          TOKEN=$(openssl rand -hex 32)
+          docker run -d --name relay-smoke -p 127.0.0.1:18080:8080 \
+            -e LISTEN_ADDR=:8080 -e RELAY_TOKEN="$TOKEN" tg-relay:ci
+          trap 'docker rm -f relay-smoke >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:18080/healthz > /tmp/healthz.json; then break; fi
+            sleep 0.5
+          done
+          cat /tmp/healthz.json
+          grep -q '"status":"ok"' /tmp/healthz.json
+          curl -fsS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18080/readyz
+          curl -fsS -o /dev/null -w 'download=%{size_download}\n' 'http://127.0.0.1:18080/download?bytes=1048576'
