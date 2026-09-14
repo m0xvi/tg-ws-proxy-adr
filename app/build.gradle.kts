@@ -59,6 +59,20 @@ android {
     }
 
     signingConfigs {
+        getByName("debug") {
+            // Общий debug-ключ: в CI восстанавливается из секрета
+            // DEBUG_KEYSTORE_BASE64 в keystore/debug.keystore и даёт подпись,
+            // идентичную установленной на телефоне (APK ставится поверх).
+            // Файл в git НЕ коммитится (см. .gitignore). Без него сборка
+            // молча использует стандартный debug-ключ раннера/машины.
+            val sharedDebugKey = rootProject.file("keystore/debug.keystore")
+            if (sharedDebugKey.exists()) {
+                storeFile = sharedDebugKey
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
         create("release") {
             val keyFile = localProperties.getProperty("KEYSTORE_FILE")
             if (keyFile != null) {

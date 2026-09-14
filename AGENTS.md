@@ -64,10 +64,12 @@ Endpoints релея: `/healthz`, `/readyz` (TCP-проверки DC1..5+203, **
 - **Вариант из handover:** `tg-project-handover/tg-ws-proxy-android/.github/workflows/android-build.yml`
   — `assembleUniversalDebug` + артефакт `TG-WS-Proxy-Lab-debug-apk`, сборка по тегу/вручную.
 - **Локально:** `build_so.bat` → `build_apk.bat`.
-- **Подпись:** чтобы APK с CI ставился **поверх** установленного, подпись должна совпадать с
-  `keystore/debug.keystore` (storepass `android`, alias `androiddebugkey`, SHA-256 `F8:7E:2B:3C:...:61`).
-  Без него CI подписывает своим debug-ключом раннера → «поверх» не встанет.
-  Альтернатива: release-ключ в секретах `ANDROID_KEYSTORE_BASE64/_PASSWORD/_ALIAS/_PASSWORD`.
+- **Подпись:** чтобы APK с CI ставился **поверх** установленного, debug-сборка
+  (`android-build.yml`) подписывается общим debug-ключом (SHA-256 `F8:7E:2B:3C:...:61`),
+  который CI восстанавливает из секрета `DEBUG_KEYSTORE_BASE64`. В git ключ **не**
+  коммитится (решение 2026-09-14: было «keystore в репо», стало «секреты»).
+  Без секрета CI подписывает ключом раннера → «поверх» не встанет.
+  Release (`build-apk.yml`): ключ из секретов `ANDROID_KEYSTORE_BASE64/_PASSWORD/_ALIAS/_PASSWORD`.
 
 ## Грабли (каждая уже стоила времени)
 
@@ -86,9 +88,10 @@ Endpoints релея: `/healthz`, `/readyz` (TCP-проверки DC1..5+203, **
    (15 прогонов) и failover-списком доменов в приложении.
 7. **Порты:** srv1 использует 8443, сертификат продлевается вручную (DNS-01 acme.sh, раз в ~80 дней).
 8. **Лимит workspace ~128 МБ** — лишние тулчейны/APK молча выкидываются из снапшота.
-9. **Публичный репозиторий:** закоммичен `keystore/debug.keystore` → кто угодно может подписать APK,
-   который Android примет как обновление установленного приложения. План был «приватный репо» —
-   решить: приватность, отдельный ключ для CI или принять риск. В доках есть реальные IP/домены VPS.
+9. **Публичный репозиторий:** ключи подписи (`keystore/`, `*.keystore`, `release.keystore`)
+   в git не коммитятся — в CI они восстанавливаются из секретов
+   (`DEBUG_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_BASE64`). Не возвращать keystore в индекс.
+   В доках есть реальные IP/домены VPS — для публичного репозитория это лишнее.
 
 ## Не коммитить / следить
 
@@ -111,10 +114,12 @@ Endpoints релея: `/healthz`, `/readyz` (TCP-проверки DC1..5+203, **
 
 ## Статус и что дальше
 
-- PR #1 (CI + восстановленный relay) был смержен, но **`main` сейчас перезаписан**: 3 коммита,
-  каталога `.github/` нет, CI в `main` отсутствует. Работа живёт в ветке
-  `arena/01a09fc8-tg-ws-proxy-adr`. Также в `main` файл `AGENTS.md` содержит текст
-  workflow вместо этого документа — заменить.
+- CI возвращён в репозиторий мержем ветки `arena/01a09fc8-tg-ws-proxy-adr`
+  (`.github/workflows/build-apk.yml` + `relay.yml`, исполняемый `gradlew`,
+  `target/` убран из индекса). Реконструкция `tg-private-relay/cmd/relay/main.go`
+  заменена настоящим исходником **0.1.2** из `relay-versions/*.zip`
+  (`/probe-upload`, `/readyz`→503 при degraded, `/media-test`). Debug-подпись —
+  через секрет `DEBUG_KEYSTORE_BASE64`, keystore из git убран.
 - Ближайшие шаги (HANDOVER §7): проверить, что CI-APK ставится поверх (совпадение подписи);
   тест v0.2.5 на телефоне с тремя доменами и failover; деплой relay3 на srv1; проверка порта 8443
   с соты; хвосты `.env` VPS#1 и `mtproto-proxy` на VPS#2; пересборка ntfy-монитора.

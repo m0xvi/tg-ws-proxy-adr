@@ -1,34 +1,8 @@
-// Command relay — персональный WSS-релей между Android-приложением
-// TG WS Proxy Lab и дата-центрами Telegram.
-//
-// Как это работает:
-//
-//	Telegram -> локальный MTProto в приложении -> WSS :443 -> Caddy -> этот релей -> TCP :443 -> DC Telegram
-//
-// Маршруты:
-//
-//	GET /healthz                     — «жив ли процесс» (JSON, без авторизации).
-//	GET /readyz                      — TCP-проверка доступности DC (JSON, без авторизации).
-//	GET /probe                       — WebSocket-handshake без подключения к Telegram.
-//	GET /download?bytes=N            — отдаёт N случайных байт (проверка больших HTTPS-загрузок).
-//	GET /probe-stream?bytes=N        — WebSocket, отдаёт N случайных байт и закрывается.
-//	GET /probe-upload?bytes=N        — WebSocket, принимает N байт и закрывается.
-//	GET /apiws?dc=N&token=...        — рабочий релей: WSS <-> TCP до DC N.
-//
-// /apiws принимает токен либо как query-параметр `token`, либо как
-// заголовок `Authorization: Bearer <token>` (так его передаёт встроенная
-// диагностика приложения). Релей подключается только к DC из белого списка,
-// поэтому он не является универсальным открытым прокси.
-//
-// Содержимое MTProto не журналируется: в лог попадают только номер сессии,
-// номер DC, длительность и счётчики байт.
 package main
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,7 +14,6 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -48,571 +21,612 @@ import (
 	"github.com/coder/websocket"
 )
 
-// version отдаётся в /healthz и /readyz; приложение показывает её в отчёте.
-const version = "0.1.1"
-
 const (
 	defaultListenAddr     = ":8080"
 	defaultMaxConnections = 256
-	defaultWSReadLimit    = 2 << 20 // 2 MiB
-	maxProbeBytes         = 100 << 20
-	defaultProbeBytes     = 1 << 20
-	probeHoldDuration     = 2 * time.Second
-	dcDialTimeout         = 5 * time.Second
-	readyzCacheTTL        = 5 * time.Second
-	tunnelReadBuffer      = 32 << 10
-	probeChunkSize        = 16 << 10
-	minTokenLength        = 32
-	maxTokenLength        = 256
+	defaultReadLimit      = 2 * 1024 * 1024
+	upstreamDialTimeout   = 8 * time.Second
+	shutdownTimeout       = 10 * time.Second
 )
 
-// dcTargets — единственные адреса, куда релей имеет право подключаться.
-// DC203 — медиа-маршрут (публичные каналы, видео, реакции, custom emoji).
-var dcTargets = map[int]string{
-	1:   "149.154.175.50:443",
-	2:   "149.154.167.51:443",
-	3:   "149.154.175.100:443",
-	4:   "149.154.167.91:443",
-	5:   "149.154.171.5:443",
-	203: "91.105.192.100:443",
-}
-
-// dcOrder задаёт порядок проверки в /readyz.
-var dcOrder = []int{1, 2, 3, 4, 5, 203}
-
-// dialUpstream вынесен в переменную, чтобы тесты могли подменить DC на
-// локальный слушатель.
-var dialUpstream = func(ctx context.Context, network, address string) (net.Conn, error) {
-	d := net.Dialer{Timeout: dcDialTimeout}
-	return d.DialContext(ctx, network, address)
-}
-
 type config struct {
-	listenAddr string
-	token      string
-	maxConns   int
-	readLimit  int64
+	listenAddr     string
+	token          string
+	maxConnections int
+	readLimit      int64
+	dcAddresses    map[int]string
 }
 
-type server struct {
-	cfg     config
-	active  atomic.Int64
-	sem     chan struct{}
-	readyzM sync.Mutex
-	readyzC *readyzResponse
-	readyzT time.Time
+type relayServer struct {
+	cfg      config
+	slots    chan struct{}
+	active   atomic.Int64
+	sessions atomic.Uint64
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
-
-func main() {
-	cfg, err := loadConfig()
-	if err != nil {
-		log.Fatalf("config: %v", err)
-	}
-
-	srv := &server{cfg: cfg, sem: make(chan struct{}, cfg.maxConns)}
-
-	httpServer := &http.Server{
-		Addr:              cfg.listenAddr,
-		Handler:           srv.handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		// Таймаутов на чтение/запись тела нет: это долгоживущие WSS-сессии.
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	go func() {
-		log.Printf("tg-relay %s listening on %s (max_connections=%d, ws_read_limit=%d)",
-			version, cfg.listenAddr, cfg.maxConns, cfg.readLimit)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("listen: %v", err)
-		}
-	}()
-
-	<-ctx.Done()
-	log.Printf("shutting down, active_sessions=%d", srv.active.Load())
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = httpServer.Shutdown(shutdownCtx)
-}
-
-func loadConfig() (config, error) {
-	cfg := config{
-		listenAddr: envString("LISTEN_ADDR", defaultListenAddr),
-		token:      strings.TrimSpace(os.Getenv("RELAY_TOKEN")),
-		maxConns:   envInt("MAX_CONNECTIONS", defaultMaxConnections),
-		readLimit:  int64(envInt("WS_READ_LIMIT_BYTES", defaultWSReadLimit)),
-	}
-	if cfg.token == "" {
-		return cfg, errors.New("RELAY_TOKEN is not set")
-	}
-	if len(cfg.token) < minTokenLength || len(cfg.token) > maxTokenLength {
-		return cfg, fmt.Errorf("RELAY_TOKEN must be %d..%d characters (got %d); "+
-			"the Android app only enables the relay for tokens of that length",
-			minTokenLength, maxTokenLength, len(cfg.token))
-	}
-	if cfg.maxConns <= 0 {
-		cfg.maxConns = defaultMaxConnections
-	}
-	if cfg.readLimit <= 0 {
-		cfg.readLimit = defaultWSReadLimit
-	}
-	return cfg, nil
-}
-
-func envString(name, fallback string) string {
-	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func envInt(name string, fallback int) int {
-	raw := strings.TrimSpace(os.Getenv(name))
-	if raw == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil {
-		log.Printf("ignoring %s=%q: %v", name, raw, err)
-		return fallback
-	}
-	return n
-}
-
-// ---------------------------------------------------------------------------
-// Диагностика
-// ---------------------------------------------------------------------------
-
-// handler собирает все маршруты релея.
-func (s *server) handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", s.handleHealthz)
-	mux.HandleFunc("/readyz", s.handleReadyz)
-	mux.HandleFunc("/probe", s.handleProbe)
-	mux.HandleFunc("/download", s.handleDownload)
-	mux.HandleFunc("/probe-stream", s.handleProbeStream)
-	mux.HandleFunc("/probe-upload", s.handleProbeUpload)
-	mux.HandleFunc("/apiws", s.handleAPIWS)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
-	})
-	return mux
-}
-
-type healthzResponse struct {
+type healthResponse struct {
 	Status         string `json:"status"`
 	ActiveSessions int64  `json:"active_sessions"`
 	Version        string `json:"version"`
 }
 
-func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	if !requireGet(w, r) {
-		return
+type readyResponse struct {
+	Status string `json:"status"`
+	Version string `json:"version"`
+	Checks []readyCheck `json:"checks"`
+}
+
+type readyCheck struct {
+	Name string `json:"name"`
+	OK bool `json:"ok"`
+	DurationMS int64 `json:"duration_ms"`
+	Error string `json:"error,omitempty"`
+}
+
+func main() {
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("configuration error: %v", err)
 	}
-	writeJSON(w, http.StatusOK, healthzResponse{
+
+	relay := &relayServer{
+		cfg:   cfg,
+		slots: make(chan struct{}, cfg.maxConnections),
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", relay.handleHealth)
+	mux.HandleFunc("GET /readyz", relay.handleReady)
+	mux.HandleFunc("GET /download", relay.handleDownload)
+	mux.HandleFunc("GET /probe", relay.handleProbe)
+	mux.HandleFunc("GET /probe-stream", relay.handleProbeStream)
+	mux.HandleFunc("GET /probe-upload", relay.handleProbeUpload)
+	mux.HandleFunc("GET /media-test", relay.handleMediaTest)
+	mux.HandleFunc("GET /apiws", relay.handleRelay)
+	mux.HandleFunc("/", notFound)
+
+	server := &http.Server{
+		Addr:              cfg.listenAddr,
+		Handler:           securityHeaders(mux),
+		ReadHeaderTimeout: 8 * time.Second,
+		IdleTimeout:       75 * time.Second,
+		MaxHeaderBytes:    32 * 1024,
+	}
+
+	stopContext, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		<-stopContext.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("shutdown: %v", err)
+		}
+	}()
+
+	log.Printf("tg-relay listening on %s; max_connections=%d", cfg.listenAddr, cfg.maxConnections)
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("http server: %v", err)
+	}
+}
+
+func loadConfig() (config, error) {
+	token := strings.TrimSpace(os.Getenv("RELAY_TOKEN"))
+	if len(token) < 32 {
+		return config{}, errors.New("RELAY_TOKEN must contain at least 32 characters")
+	}
+
+	cfg := config{
+		listenAddr:     envOr("LISTEN_ADDR", defaultListenAddr),
+		token:          token,
+		maxConnections: envInt("MAX_CONNECTIONS", defaultMaxConnections),
+		readLimit:      int64(envInt("WS_READ_LIMIT_BYTES", defaultReadLimit)),
+		dcAddresses: map[int]string{
+			1:   envOr("DC1_ADDR", "149.154.175.50:443"),
+			2:   envOr("DC2_ADDR", "149.154.167.51:443"),
+			3:   envOr("DC3_ADDR", "149.154.175.100:443"),
+			4:   envOr("DC4_ADDR", "149.154.167.91:443"),
+			5:   envOr("DC5_ADDR", "149.154.171.5:443"),
+			203: envOr("DC203_ADDR", "91.105.192.100:443"),
+		},
+	}
+	if cfg.maxConnections < 1 || cfg.maxConnections > 10000 {
+		return config{}, errors.New("MAX_CONNECTIONS must be between 1 and 10000")
+	}
+	if cfg.readLimit < 64*1024 || cfg.readLimit > 64*1024*1024 {
+		return config{}, errors.New("WS_READ_LIMIT_BYTES is outside the safe range")
+	}
+	for dc, address := range cfg.dcAddresses {
+		if _, _, err := net.SplitHostPort(address); err != nil {
+			return config{}, fmt.Errorf("invalid DC%d address %q: %w", dc, address, err)
+		}
+	}
+	return cfg, nil
+}
+
+func (s *relayServer) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(healthResponse{
 		Status:         "ok",
 		ActiveSessions: s.active.Load(),
-		Version:        version,
+		Version:        "0.1.2",
 	})
 }
 
-type readyzCheck struct {
-	Name      string `json:"name"`
-	Target    string `json:"target"`
-	OK        bool   `json:"ok"`
-	LatencyMS int64  `json:"latency_ms"`
-	Error     string `json:"error,omitempty"`
-}
+func (s *relayServer) handleReady(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
 
-type readyzResponse struct {
-	Status  string        `json:"status"`
-	Version string        `json:"version"`
-	Checks  []readyzCheck `json:"checks"`
-}
-
-func (s *server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	if !requireGet(w, r) {
-		return
-	}
-	writeJSON(w, http.StatusOK, s.readyz(r.Context()))
-}
-
-func (s *server) readyz(ctx context.Context) readyzResponse {
-	s.readyzM.Lock()
-	defer s.readyzM.Unlock()
-	if s.readyzC != nil && time.Since(s.readyzT) < readyzCacheTTL {
-		return *s.readyzC
-	}
-
-	checks := make([]readyzCheck, 0, len(dcOrder))
+	checks := make([]readyCheck, 0, len(s.cfg.dcAddresses))
 	allOK := true
-	for _, dc := range dcOrder {
-		target := dcTargets[dc]
-		check := readyzCheck{Name: fmt.Sprintf("dc%d", dc), Target: target}
-		start := time.Now()
-		conn, err := dialUpstream(ctx, "tcp", target)
-		check.LatencyMS = time.Since(start).Milliseconds()
+	for _, dc := range []int{1, 2, 3, 4, 5, 203} {
+		addr, ok := s.cfg.dcAddresses[dc]
+		if !ok {
+			continue
+		}
+		started := time.Now()
+		dialer := net.Dialer{Timeout: 4 * time.Second, KeepAlive: 30 * time.Second}
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		check := readyCheck{
+			Name:       fmt.Sprintf("dc%d", dc),
+			OK:         err == nil,
+			DurationMS: time.Since(started).Milliseconds(),
+		}
 		if err != nil {
-			check.Error = err.Error()
 			allOK = false
+			check.Error = compactReadyError(err)
 		} else {
-			check.OK = true
 			_ = conn.Close()
 		}
 		checks = append(checks, check)
 	}
 
-	resp := readyzResponse{Status: "ok", Version: version, Checks: checks}
+	status := "ok"
 	if !allOK {
-		resp.Status = "degraded"
+		status = "degraded"
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}
-	s.readyzC, s.readyzT = &resp, time.Now()
-	return resp
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(readyResponse{Status: status, Version: "0.1.2", Checks: checks})
 }
 
-// handleProbe — публичный WebSocket-handshake. Приложение использует его,
-// чтобы понять, доходит ли WSS до VPS в мобильной сети, ничего не отправляя
-// в Telegram.
-func (s *server) handleProbe(w http.ResponseWriter, r *http.Request) {
-	if !requireGet(w, r) {
-		return
-	}
-	ws, err := acceptWS(w, r, s.cfg.readLimit)
-	if err != nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), probeHoldDuration)
-	defer cancel()
-	<-ctx.Done()
-	closeGracefully(ws)
-}
-
-// handleDownload — предсказуемая HTTPS-загрузка N байт.
-func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
-	if !requireGet(w, r) {
-		return
-	}
-	n, err := parseBytesParam(r)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
+func (s *relayServer) handleDownload(w http.ResponseWriter, r *http.Request) {
+	bytesToSend := boundedBytesParam(r, 1024*1024, 64*1024*1024)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
-	block := randomBlock(probeChunkSize)
-	written := int64(0)
-	for written < n {
-		size := int64(len(block))
-		if remaining := n - written; remaining < size {
-			size = remaining
-		}
-		if _, err := w.Write(block[:size]); err != nil {
-			return
-		}
-		written += size
-	}
+	w.Header().Set("Content-Length", strconv.Itoa(bytesToSend))
+	writePattern(w, bytesToSend)
 }
 
-func (s *server) handleProbeStream(w http.ResponseWriter, r *http.Request) {
-	if !requireGet(w, r) {
-		return
-	}
-	n, err := parseBytesParam(r)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	ws, err := acceptWS(w, r, s.cfg.readLimit)
+func (s *relayServer) handleProbeStream(w http.ResponseWriter, r *http.Request) {
+	bytesToSend := boundedBytesParam(r, 1024*1024, 64*1024*1024)
+	conn, err := acceptWebSocket(w, r, 64*1024)
 	if err != nil {
 		return
 	}
-	ctx := context.Background()
+	defer conn.CloseNow()
 
-	block := randomBlock(probeChunkSize)
-	sent := int64(0)
-	for sent < n {
-		size := int64(len(block))
-		if remaining := n - sent; remaining < size {
-			size = remaining
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	buf := make([]byte, 64*1024)
+	fillPattern(buf)
+	remaining := bytesToSend
+	for remaining > 0 {
+		n := len(buf)
+		if remaining < n {
+			n = remaining
 		}
-		writer, err := ws.Writer(ctx, websocket.MessageBinary)
+		if err := conn.Write(ctx, websocket.MessageBinary, buf[:n]); err != nil {
+			return
+		}
+		remaining -= n
+	}
+	_ = conn.Close(websocket.StatusNormalClosure, "stream complete")
+}
+
+func (s *relayServer) handleProbeUpload(w http.ResponseWriter, r *http.Request) {
+	bytesExpected := boundedBytesParam(r, 1024*1024, 64*1024*1024)
+	conn, err := acceptWebSocket(w, r, 256*1024)
+	if err != nil {
+		return
+	}
+	defer conn.CloseNow()
+
+	ctx, cancel := context.WithTimeout(r.Context(), 75*time.Second)
+	defer cancel()
+	started := time.Now()
+	var got int
+	for got < bytesExpected {
+		messageType, payload, err := conn.Read(ctx)
 		if err != nil {
-			ws.CloseNow()
 			return
 		}
-		if _, err := writer.Write(block[:size]); err != nil {
-			_ = writer.Close()
-			ws.CloseNow()
+		if messageType != websocket.MessageBinary {
+			_ = conn.Close(websocket.StatusUnsupportedData, "binary required")
 			return
 		}
-		if err := writer.Close(); err != nil {
-			ws.CloseNow()
-			return
-		}
-		sent += size
+		got += len(payload)
 	}
-	closeGracefully(ws)
+	msg := fmt.Sprintf("upload-ok bytes=%d duration_ms=%d", got, time.Since(started).Milliseconds())
+	_ = conn.Write(ctx, websocket.MessageText, []byte(msg))
+	_ = conn.Close(websocket.StatusNormalClosure, "upload complete")
 }
 
-func (s *server) handleProbeUpload(w http.ResponseWriter, r *http.Request) {
-	if !requireGet(w, r) {
-		return
-	}
-	n, err := parseBytesParam(r)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	// Большая upload-проверка приходит одним или несколькими сообщениями,
-	// поэтому лимит на чтение здесь поднимаем только до размера проверки.
-	limit := s.cfg.readLimit
-	if n+int64(probeChunkSize) > limit {
-		limit = n + int64(probeChunkSize)
-	}
-	ws, err := acceptWS(w, r, limit)
-	if err != nil {
-		return
-	}
-	ctx := context.Background()
-
-	received := int64(0)
-	for received < n {
-		_, data, err := ws.Read(ctx)
-		if err != nil {
-			ws.CloseNow()
-			return
-		}
-		received += int64(len(data))
-	}
-	closeGracefully(ws)
+func (s *relayServer) handleMediaTest(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = io.WriteString(w, mediaTestHTML)
 }
 
-// ---------------------------------------------------------------------------
-// Рабочий релей
-// ---------------------------------------------------------------------------
+func boundedBytesParam(r *http.Request, fallback int, maxValue int) int {
+	value := strings.TrimSpace(r.URL.Query().Get("bytes"))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 1 {
+		return fallback
+	}
+	if parsed > maxValue {
+		return maxValue
+	}
+	return parsed
+}
 
-func (s *server) handleAPIWS(w http.ResponseWriter, r *http.Request) {
-	if !requireGet(w, r) {
+func writePattern(w io.Writer, total int) {
+	buf := make([]byte, 64*1024)
+	fillPattern(buf)
+	remaining := total
+	for remaining > 0 {
+		n := len(buf)
+		if remaining < n {
+			n = remaining
+		}
+		if _, err := w.Write(buf[:n]); err != nil {
+			return
+		}
+		remaining -= n
+	}
+}
+
+func fillPattern(buf []byte) {
+	for i := range buf {
+		buf[i] = byte((i*31 + 17) & 0xff)
+	}
+}
+
+func compactReadyError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if len(msg) > 160 {
+		msg = msg[:160]
+	}
+	return msg
+}
+
+const mediaTestHTML = `<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TG Relay Media Test</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:20px;line-height:1.4;max-width:820px}
+button{font-size:16px;padding:10px 14px;margin:6px 6px 6px 0}
+pre{background:#111;color:#eee;padding:12px;border-radius:8px;white-space:pre-wrap;word-break:break-word}
+.ok{color:#0a7f22}.bad{color:#b00020}
+</style>
+</head>
+<body>
+<h1>TG Relay Media Test</h1>
+<p>Тестирует большой HTTPS download, WSS download и WSS upload через этот же домен. Токен relay не используется.</p>
+<p>
+<button onclick="runAll(1048576)">Тест 1 MiB</button>
+<button onclick="runAll(10485760)">Тест 10 MiB</button>
+<button onclick="runAll(52428800)">Тест 50 MiB</button>
+<button onclick="clearLog()">Очистить</button>
+</p>
+<pre id="log"></pre>
+<script>
+const logEl = document.getElementById('log');
+function log(s){ logEl.textContent += s + '\n'; }
+function clearLog(){ logEl.textContent=''; }
+function fmt(n){ return (n/1048576).toFixed(2)+' MiB'; }
+async function testHttp(bytes){
+  const url = '/download?bytes=' + bytes + '&_=' + Date.now();
+  const started = performance.now();
+  const r = await fetch(url, {cache:'no-store'});
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  const reader = r.body.getReader();
+  let got = 0;
+  while(true){
+    const {done, value} = await reader.read();
+    if(done) break;
+    got += value.byteLength;
+  }
+  const sec = (performance.now()-started)/1000;
+  log('HTTPS download: '+fmt(got)+' за '+sec.toFixed(2)+'s, '+(got/sec/1048576).toFixed(2)+' MiB/s');
+  if(got < bytes) throw new Error('short HTTPS download '+got+'/'+bytes);
+}
+function testWs(bytes){
+  return new Promise((resolve,reject)=>{
+    const scheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const ws = new WebSocket(scheme + location.host + '/probe-stream?bytes=' + bytes + '&_=' + Date.now(), 'binary');
+    ws.binaryType = 'arraybuffer';
+    let got = 0;
+    const started = performance.now();
+    const timeout = setTimeout(()=>{ try{ws.close()}catch(e){}; reject(new Error('WebSocket timeout, got '+got)); }, 60000);
+    ws.onmessage = ev => { got += ev.data.byteLength || ev.data.size || 0; };
+    ws.onerror = () => { clearTimeout(timeout); reject(new Error('WebSocket error, got '+got)); };
+    ws.onclose = () => {
+      clearTimeout(timeout);
+      const sec = (performance.now()-started)/1000;
+      log('WSS stream: '+fmt(got)+' за '+sec.toFixed(2)+'s, '+(got/sec/1048576).toFixed(2)+' MiB/s');
+      if(got >= bytes) resolve(); else reject(new Error('short WSS stream '+got+'/'+bytes));
+    };
+  });
+}
+
+function testWsUpload(bytes){
+  return new Promise((resolve,reject)=>{
+    const scheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const ws = new WebSocket(scheme + location.host + '/probe-upload?bytes=' + bytes + '&_=' + Date.now(), 'binary');
+    const chunkSize = 64 * 1024;
+    const chunk = new Uint8Array(chunkSize);
+    for(let i=0;i<chunk.length;i++) chunk[i]=(i*31+17)&255;
+    let sent = 0;
+    let ack = '';
+    const started = performance.now();
+    const timeout = setTimeout(()=>{ try{ws.close()}catch(e){}; reject(new Error('WebSocket upload timeout, sent '+sent)); }, 75000);
+    ws.onopen = () => {
+      function pump(){
+        while(sent < bytes && ws.bufferedAmount < 1024*1024){
+          const n = Math.min(chunkSize, bytes-sent);
+          ws.send(n === chunkSize ? chunk : chunk.slice(0,n));
+          sent += n;
+        }
+        if(sent < bytes) setTimeout(pump, 10);
+      }
+      pump();
+    };
+    ws.onmessage = ev => { ack += String(ev.data || ''); };
+    ws.onerror = () => { clearTimeout(timeout); reject(new Error('WebSocket upload error, sent '+sent)); };
+    ws.onclose = () => {
+      clearTimeout(timeout);
+      const sec = (performance.now()-started)/1000;
+      log('WSS upload: '+fmt(sent)+' за '+sec.toFixed(2)+'s, '+(sent/sec/1048576).toFixed(2)+' MiB/s ack='+ack);
+      if(sent >= bytes && ack.indexOf('upload-ok') >= 0) resolve(); else reject(new Error('upload no ack, sent '+sent+' ack='+ack));
+    };
+  });
+}
+
+async function readyz(){
+  const r = await fetch('/readyz?_=' + Date.now(), {cache:'no-store'});
+  const text = await r.text();
+  log('/readyz HTTP '+r.status+': '+text);
+}
+async function runAll(bytes){
+  log('--- '+new Date().toISOString()+' test '+fmt(bytes)+' ---');
+  try { await readyz(); } catch(e) { log('readyz FAIL: '+e.message); }
+  try { await testHttp(bytes); log('HTTPS OK'); } catch(e) { log('HTTPS FAIL: '+e.message); }
+  try { await testWs(bytes); log('WSS download OK'); } catch(e) { log('WSS download FAIL: '+e.message); }
+  try { await testWsUpload(bytes); log('WSS upload OK'); } catch(e) { log('WSS upload FAIL: '+e.message); }
+}
+</script>
+</body>
+</html>`
+
+// /probe performs only a short WebSocket handshake. It never connects to
+// Telegram and intentionally needs no secret, so the Android diagnostic app can
+// verify DNS/TCP/TLS/WSS reachability without placing RELAY_TOKEN in a report.
+func (s *relayServer) handleProbe(w http.ResponseWriter, r *http.Request) {
+	conn, err := acceptWebSocket(w, r, 64*1024)
+	if err != nil {
 		return
 	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	_ = conn.Write(ctx, websocket.MessageText, []byte("probe-ok"))
+	_ = conn.Close(websocket.StatusNormalClosure, "probe complete")
+}
+
+func (s *relayServer) handleRelay(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	dc, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("dc")))
+	dc, err := strconv.Atoi(r.URL.Query().Get("dc"))
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "dc must be an integer"})
+		http.Error(w, "invalid dc", http.StatusBadRequest)
 		return
 	}
-	target, ok := dcTargets[dc]
+	upstreamAddress, ok := s.cfg.dcAddresses[dc]
 	if !ok {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "dc is not in the relay whitelist"})
+		http.Error(w, "unsupported dc", http.StatusBadRequest)
 		return
 	}
 
 	select {
-	case s.sem <- struct{}{}:
+	case s.slots <- struct{}{}:
+		defer func() { <-s.slots }()
 	default:
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "relay is at capacity"})
+		http.Error(w, "relay busy", http.StatusServiceUnavailable)
 		return
 	}
-	defer func() { <-s.sem }()
 
-	// Сначала дозваниваемся до DC: если Telegram недоступен с этого VPS,
-	// клиент должен получить честный HTTP-отказ, а не оборванный WebSocket.
-	upstream, err := dialUpstream(r.Context(), "tcp", target)
+	dialer := net.Dialer{Timeout: upstreamDialTimeout, KeepAlive: 30 * time.Second}
+	upstream, err := dialer.DialContext(r.Context(), "tcp", upstreamAddress)
 	if err != nil {
-		log.Printf("dial dc%d %s failed: %v", dc, target, err)
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "telegram dc is unreachable"})
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 		return
 	}
 	defer upstream.Close()
 
-	ws, err := acceptWS(w, r, s.cfg.readLimit)
+	conn, err := acceptWebSocket(w, r, s.cfg.readLimit)
 	if err != nil {
 		return
 	}
+	defer conn.CloseNow()
 
-	session := sessionID()
+	sessionID := s.sessions.Add(1)
 	s.active.Add(1)
+	defer s.active.Add(-1)
 	started := time.Now()
-	log.Printf("session=%s dc=%d target=%s start", session, dc, target)
 
-	up, down := tunnel(ws, upstream)
-
-	s.active.Add(-1)
-	log.Printf("session=%s dc=%d bytes_client_to_dc=%d bytes_dc_to_client=%d duration=%s",
-		session, dc, up, down, time.Since(started).Round(time.Millisecond))
-}
-
-// tunnel перекладывает байты между WebSocket и TCP, пока одна из сторон не
-// закроется. Возвращает объём трафика в обе стороны.
-func tunnel(ws *websocket.Conn, upstream net.Conn) (clientToDC, dcToClient int64) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	errCh := make(chan error, 2)
+	var uploaded atomic.Int64
+	var downloaded atomic.Int64
 
-	var up, down atomic.Int64
-	var wg sync.WaitGroup
-
-	// WebSocket -> TCP
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
-		defer cancel()
-		for {
-			_, data, err := ws.Read(ctx)
-			if err != nil {
-				return
-			}
-			if len(data) == 0 {
-				continue
-			}
-			if _, err := upstream.Write(data); err != nil {
-				return
-			}
-			up.Add(int64(len(data)))
-		}
+		errCh <- websocketToTCP(ctx, conn, upstream, &uploaded)
+	}()
+	go func() {
+		errCh <- tcpToWebsocket(ctx, conn, upstream, &downloaded)
 	}()
 
-	// TCP -> WebSocket
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		buf := make([]byte, tunnelReadBuffer)
-		for {
-			n, err := upstream.Read(buf)
-			if n > 0 {
-				writer, werr := ws.Writer(ctx, websocket.MessageBinary)
-				if werr != nil {
-					return
-				}
-				if _, werr := writer.Write(buf[:n]); werr != nil {
-					_ = writer.Close()
-					return
-				}
-				if werr := writer.Close(); werr != nil {
-					return
-				}
-				down.Add(int64(n))
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	<-ctx.Done()
+	firstErr := <-errCh
+	cancel()
+	_ = upstream.SetDeadline(time.Now())
 	_ = upstream.Close()
-	closeGracefully(ws)
-	wg.Wait()
-	return up.Load(), down.Load()
+	_ = conn.Close(websocket.StatusNormalClosure, "session complete")
+
+	// Never log the token, query string, client IP, or Telegram payload.
+	log.Printf(
+		"session=%d dc=%d duration=%s up=%d down=%d result=%s",
+		sessionID,
+		dc,
+		time.Since(started).Round(time.Millisecond),
+		uploaded.Load(),
+		downloaded.Load(),
+		classifyBridgeError(firstErr),
+	)
 }
 
-// ---------------------------------------------------------------------------
-// Хелперы
-// ---------------------------------------------------------------------------
-
-func (s *server) authorized(r *http.Request) bool {
-	token := ""
-	if header := r.Header.Get("Authorization"); header != "" {
-		if len(header) > len("bearer ") && strings.EqualFold(header[:len("bearer ")], "bearer ") {
-			token = strings.TrimSpace(header[len("bearer "):])
-		}
-	}
-	if token == "" {
-		token = r.URL.Query().Get("token")
-	}
-	if token == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.token)) == 1
-}
-
-func acceptWS(w http.ResponseWriter, r *http.Request, readLimit int64) (*websocket.Conn, error) {
-	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// Клиент — мобильное приложение, а не браузер: проверка Origin здесь
-		// бессмысленна, доступ защищён токеном.
-		InsecureSkipVerify: true,
+func acceptWebSocket(w http.ResponseWriter, r *http.Request, readLimit int64) (*websocket.Conn, error) {
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		Subprotocols:       []string{"binary"},
+		InsecureSkipVerify: true, // Native app may omit Origin; relay auth protects /apiws.
 		CompressionMode:    websocket.CompressionDisabled,
 	})
 	if err != nil {
-		// Accept уже сам ответил клиенту кодом ошибки.
-		log.Printf("ws accept failed: %v", err)
 		return nil, err
 	}
-	ws.SetReadLimit(readLimit)
-	return ws, nil
+	conn.SetReadLimit(readLimit)
+	return conn, nil
 }
 
-// closeGracefully отправляет close-frame, но не ждёт ответа дольше двух секунд.
-func closeGracefully(ws *websocket.Conn) {
-	done := make(chan struct{})
-	go func() {
-		_ = ws.Close(websocket.StatusNormalClosure, "")
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		ws.CloseNow()
+func websocketToTCP(
+	ctx context.Context,
+	conn *websocket.Conn,
+	upstream net.Conn,
+	counter *atomic.Int64,
+) error {
+	for {
+		messageType, payload, err := conn.Read(ctx)
+		if err != nil {
+			return err
+		}
+		if messageType != websocket.MessageBinary {
+			return errors.New("non-binary WebSocket message")
+		}
+		if err := writeAll(upstream, payload); err != nil {
+			return err
+		}
+		counter.Add(int64(len(payload)))
 	}
 }
 
-func requireGet(w http.ResponseWriter, r *http.Request) bool {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET")
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-		return false
-	}
-	return true
-}
-
-func parseBytesParam(r *http.Request) (int64, error) {
-	raw := strings.TrimSpace(r.URL.Query().Get("bytes"))
-	if raw == "" {
-		return defaultProbeBytes, nil
-	}
-	n, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || n < 0 {
-		return 0, errors.New("bytes must be a non-negative integer")
-	}
-	if n > maxProbeBytes {
-		n = maxProbeBytes
-	}
-	return n, nil
-}
-
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
-}
-
-func randomBlock(size int) []byte {
-	block := make([]byte, size)
-	if _, err := io.ReadFull(rand.Reader, block); err != nil {
-		// crypto/rand практически не может отказать; на всякий случай
-		// отдаём детерминированный блок, чтобы проверка не падала.
-		for i := range block {
-			block[i] = byte(i)
+func tcpToWebsocket(
+	ctx context.Context,
+	conn *websocket.Conn,
+	upstream net.Conn,
+	counter *atomic.Int64,
+) error {
+	buffer := make([]byte, 64*1024)
+	for {
+		n, err := upstream.Read(buffer)
+		if n > 0 {
+			if writeErr := conn.Write(ctx, websocket.MessageBinary, buffer[:n]); writeErr != nil {
+				return writeErr
+			}
+			counter.Add(int64(n))
+		}
+		if err != nil {
+			return err
 		}
 	}
-	return block
 }
 
-func sessionID() string {
-	raw := make([]byte, 8)
-	if _, err := io.ReadFull(rand.Reader, raw); err != nil {
-		return "unknown"
+func writeAll(writer io.Writer, payload []byte) error {
+	for len(payload) > 0 {
+		n, err := writer.Write(payload)
+		if err != nil {
+			return err
+		}
+		payload = payload[n:]
 	}
-	return hex.EncodeToString(raw)
+	return nil
+}
+
+func (s *relayServer) authorized(r *http.Request) bool {
+	provided := strings.TrimSpace(r.URL.Query().Get("token"))
+	if header := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(header, "Bearer ") {
+		provided = strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+	}
+	if len(provided) != len(s.cfg.token) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(s.cfg.token)) == 1
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func notFound(w http.ResponseWriter, r *http.Request) {
+	http.NotFound(w, r)
+}
+
+func classifyBridgeError(err error) string {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+		return "closed"
+	}
+	status := websocket.CloseStatus(err)
+	if status == websocket.StatusNormalClosure || status == websocket.StatusGoingAway {
+		return "closed"
+	}
+	return "error"
+}
+
+func envOr(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func envInt(name string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }

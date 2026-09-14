@@ -120,6 +120,15 @@ base64 -w0 release.keystore > keystore.b64   # содержимое файла -
 | `ANDROID_KEY_ALIAS` | `tgwsproxy` (или свой alias) |
 | `ANDROID_KEY_PASSWORD` | пароль ключа |
 
+### Debug-сборка поверх установленной (android-build.yml)
+
+Второй workflow [`.github/workflows/android-build.yml`](.github/workflows/android-build.yml)
+собирает один `assembleUniversalDebug` и подписывает его **общим debug-ключом**
+из секрета `DEBUG_KEYSTORE_BASE64` — такой APK ставится поверх установленного
+на телефоне без удаления данных. Без секрета сборка тоже проходит, но подпись
+будет чужой (ключ раннера). Подробности и сверка отпечатка — в
+[`CI-BUILD.md`](CI-BUILD.md). Ключи в git не коммитятся.
+
 Локальная сборка (`build_so.bat` + `build_apk.bat`) продолжает работать как раньше: workflow читает те же `versionName` из `app/build.gradle.kts` и раскладывает APK по той же схеме имён.
 
 ## Лицензия
