@@ -1,0 +1,19 @@
+# Gradle / Android
+.gradle/
+build/
+app/build/
+local.properties
+.idea/
+*.iml
+.kotlin/
+.cxx/
+
+# Rust
+target/
+
+# Логи
+*.log
+
+# ВАЖНО: keystore/debug.keystore хранится В РЕПОЗИТОРИИ нарочно —
+# это debug-ключ (не секрет), он гарантирует одинаковую подпись
+# локальных и CI-сборок. Не удалять и не игнорировать.

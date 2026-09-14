@@ -1,0 +1,22 @@
+{
+	admin off
+}
+
+{$RELAY_DOMAIN}:8443 {
+	# Сертификат выпускается вручную через acme.sh (DNS-01):
+	# порты 80/443 на этом VPS заняты nginx/xray, классический ACME недоступен.
+	tls /etc/caddy/certs/fullchain.pem /etc/caddy/certs/privkey.pem
+
+	# Access logging is intentionally disabled: query parameters may contain
+	# relay credentials in early client builds.
+	reverse_proxy relay:8080 {
+		flush_interval -1
+	}
+
+	header {
+		-Server
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Cache-Control "no-store"
+	}
+}
